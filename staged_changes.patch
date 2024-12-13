@@ -1,0 +1,415 @@
+diff --git a/src/mem/cache/Cache.py b/src/mem/cache/Cache.py
+index 72665e1..18abfda 100644
+--- a/src/mem/cache/Cache.py
++++ b/src/mem/cache/Cache.py
+@@ -107,6 +107,7 @@ class BaseCache(ClockedObject):
+         "Replacement policy")
+ 
+     compressor = Param.BaseCacheCompressor(NULL, "Cache compressor.")
++    gcp = Param.Bool(False,"Enable the global cache predictor.")
+     replace_expansions = Param.Bool(True, "Apply replacement policy to " \
+         "decide which blocks should be evicted on a data expansion")
+     # When a block passes from uncompressed to compressed, it may become
+diff --git a/src/mem/cache/base.cc b/src/mem/cache/base.cc
+index cf6c9fe..5fc6055 100644
+--- a/src/mem/cache/base.cc
++++ b/src/mem/cache/base.cc
+@@ -84,6 +84,8 @@ BaseCache::BaseCache(const BaseCacheParams &p, unsigned blk_size)
+       writeBuffer("write buffer", p.write_buffers, p.mshrs, p.name),
+       tags(p.tags),
+       compressor(p.compressor),
++      gcp(p.gcp),
++      //gcpCounter(0),
+       prefetcher(p.prefetcher),
+       writeAllocator(p.write_allocator),
+       writebackClean(p.writeback_clean),
+@@ -133,7 +135,9 @@ BaseCache::BaseCache(const BaseCacheParams &p, unsigned blk_size)
+     warn_if(!compressor && dynamic_cast<CompressedTags*>(tags),
+         "Compressed cache %s does not have a compression algorithm", name());
+     if (compressor)
+-        compressor->setCache(this);
++        compressor->setCache(this); 
++    if (gcp && !compressor)
++        fatal("GCP requires a compression algorithm");
+ }
+ 
+ BaseCache::~BaseCache()
+@@ -985,9 +989,18 @@ BaseCache::updateCompressionData(CacheBlk *&blk, const uint64_t* data,
+     // metadata can be updated.
+     Cycles compression_lat = Cycles(0);
+     Cycles decompression_lat = Cycles(0);
+-    const auto comp_data =
+-        compressor->compress(data, compression_lat, decompression_lat);
+-    std::size_t compression_size = comp_data->getSizeBits();
++    CompressedTags* comp_tags = static_cast<CompressedTags*>(tags);
++    std::size_t compression_size = blkSize * CHAR_BIT;
++
++    if (gcp) {
++        if (comp_tags->getGcpFactor() >= 0) {
++            const auto comp_data = compressor->compress(data, compression_lat, decompression_lat);
++            compression_size = comp_data->getSizeBits();
++            printf("[%s], Compressing blk, compressed size: %d Byte, gcp_factor: %d, curTick: %lu \n", __func__, compression_size / 8, comp_tags->getGcpFactor(), curTick());
++        }
++    } else if (!compressor) {
++        fatal("fatal, no compressor");
++    }
+ 
+     // Get previous compressed size
+     CompressionBlk* compression_blk = static_cast<CompressionBlk*>(blk);
+@@ -1622,12 +1635,28 @@ BaseCache::allocateBlock(const PacketPtr pkt, PacketList &writebacks)
+     // compressor is used, the compression/decompression methods are called to
+     // calculate the amount of extra cycles needed to read or write compressed
+     // blocks.
+-    if (compressor && pkt->hasData()) {
+-        const auto comp_data = compressor->compress(
+-            pkt->getConstPtr<uint64_t>(), compression_lat, decompression_lat);
+-        blk_size_bits = comp_data->getSizeBits();
+-    }
+ 
++    //  여기에서 껐다 키면 될듯
++
++    CompressedTags* comp_tags = static_cast<CompressedTags*>(tags);
++    if (gcp) {
++        if (comp_tags->getGcpFactor()>=0 && compressor && pkt->hasData()) {
++            const auto comp_data = compressor->compress(
++                pkt->getConstPtr<uint64_t>(), compression_lat, decompression_lat);
++            blk_size_bits = comp_data->getSizeBits();
++            // printf("compressed size: %zu \n", blk_size_bits);
++            printf("[%s], Compressing blk, compressed size: %d Byte, gcp_factor: %d, curTick: %lu \n", __func__, blk_size_bits / 8, comp_tags->getGcpFactor(), curTick());
++        }
++        else{
++        }
++    }
++    else {
++        if (compressor && pkt->hasData()) {
++            const auto comp_data = compressor->compress(
++                pkt->getConstPtr<uint64_t>(), compression_lat, decompression_lat);
++            blk_size_bits = comp_data->getSizeBits();
++        }
++    }
+     // Find replacement victim
+     std::vector<CacheBlk*> evict_blks;
+     CacheBlk *victim = tags->findVictim(addr, is_secure, blk_size_bits,
+diff --git a/src/mem/cache/base.hh b/src/mem/cache/base.hh
+index 6fc7628..0da100b 100644
+--- a/src/mem/cache/base.hh
++++ b/src/mem/cache/base.hh
+@@ -352,6 +352,12 @@ class BaseCache : public ClockedObject
+     /** Compression method being used. */
+     compression::Base* compressor;
+ 
++    /** GCP on off */
++    const bool gcp;
++
++    /*GCP Counter*/
++    int gcpCounter;
++
+     /** Prefetcher */
+     prefetch::Base *prefetcher;
+ 
+diff --git a/src/mem/cache/compressors/Compressors.py b/src/mem/cache/compressors/Compressors.py
+index ec93900..677cff2 100644
+--- a/src/mem/cache/compressors/Compressors.py
++++ b/src/mem/cache/compressors/Compressors.py
+@@ -159,7 +159,7 @@ class FPC(BaseDictionaryCompressor):
+     comp_chunks_per_cycle = 8
+     comp_extra_latency = 1
+     decomp_chunks_per_cycle = 4
+-    decomp_extra_latency = 1
++    decomp_extra_latency = 5
+ 
+     # Dummy dictionary size, since FPC has no dictionary
+     dictionary_size = 1
+diff --git a/src/mem/cache/tags/Tags.py b/src/mem/cache/tags/Tags.py
+index 0bc11bb..054cac0 100644
+--- a/src/mem/cache/tags/Tags.py
++++ b/src/mem/cache/tags/Tags.py
+@@ -118,6 +118,9 @@ class CompressedTags(SectorTags):
+     # the cache size by the compression ratio
+     size = Parent.size * Self.max_compression_ratio
+ 
++    gcp_inc = Param.Int(1,"gcp dec factor")
++    gcp_dec = Param.Int(1,"gcp inc factor")
++
+ class FALRU(BaseTags):
+     type = 'FALRU'
+     cxx_header = "mem/cache/tags/fa_lru.hh"
+diff --git a/src/mem/cache/tags/compressed_tags.cc b/src/mem/cache/tags/compressed_tags.cc
+index 32d7401..8e48b80 100644
+--- a/src/mem/cache/tags/compressed_tags.cc
++++ b/src/mem/cache/tags/compressed_tags.cc
+@@ -40,13 +40,17 @@
+ #include "mem/cache/tags/indexing_policies/base.hh"
+ #include "mem/packet.hh"
+ #include "params/CompressedTags.hh"
++#include "sim/sim_exit.hh"
+ 
+ namespace gem5
+ {
+ 
+ CompressedTags::CompressedTags(const Params &p)
+-    : SectorTags(p)
+-{
++    : SectorTags(p), 
++    gcp_factor(0), gcp_dec(p.gcp_dec), gcp_inc(p.gcp_inc)
++{   
++    printf("Initialize Compressed Tags!");
++    printf("gcp_dec: %d, gcp_inc: %d", gcp_dec, gcp_inc);
+ }
+ 
+ void
+@@ -102,6 +106,88 @@ CompressedTags::tagsInit()
+ }
+ 
+ CacheBlk*
++CompressedTags::accessBlock(const PacketPtr pkt, Cycles &lat)
++{
++    CacheBlk* blk = findBlock(pkt->getAddr(), pkt->isSecure());
++    
++    // Access all tags in parallel, hence one in each way.  The data side
++    // either accesses all blocks in parallel, or one block sequentially on
++    // a hit.  Sequential access with a miss doesn't access data.
++    stats.tagAccesses += allocAssoc;
++    if (sequentialAccess) {
++        if (blk != nullptr) {
++            stats.dataAccesses += 1;
++        }
++    } else {
++        stats.dataAccesses += allocAssoc*numBlocksPerSector;
++    }
++    
++    //printf("blk = nullptr: %d \n", blk==nullptr);
++
++    if(blk != nullptr){
++        SectorSubBlk* sub_blk = static_cast<SectorSubBlk*>(blk);
++        SectorBlk* sector_blk = sub_blk->getSectorBlock();
++        CompressionBlk* compressed_blk = static_cast<CompressionBlk*>(sub_blk);
++        const SuperBlk* super_blk = static_cast<SuperBlk*>(sector_blk);
++
++        const int rest_offset = (compressed_blk -> getSectorOffset())^1;
++
++        CompressionBlk* rest_compressed_blk = static_cast<CompressionBlk*>(super_blk->blks[rest_offset]);
++
++        // Hit
++        if (!compressed_blk->isCompressed()){
++            // printf("[%s], Unpenalized Hit, curTick: %lu \n", __func__, curTick());
++        }
++        else if (compressed_blk->isCompressed()&&super_blk->canCoAllocate(rest_compressed_blk->getSizeBits())){
++            gcp_factor -= gcp_dec;
++            printf("[%s], Penalized Hit, gcp_factor: %d, curTick: %lu \n", __func__, gcp_factor, curTick());
++
++        }
++        else if (compressed_blk->isCompressed()&&!super_blk->canCoAllocate(rest_compressed_blk->getSizeBits())){
++            gcp_factor += gcp_inc;
++            printf("[%s], Avoided Miss, gcp_factor: %d, curTick: %lu \n", __func__, gcp_factor, curTick());
++        }
++    }
++    
++    if (blk != nullptr) {
++        // Update number of references to accessed block
++        blk->increaseRefCount();
++        
++        // Get block's sector
++        SectorSubBlk* sub_blk = static_cast<SectorSubBlk*>(blk);
++        const SectorBlk* sector_blk = sub_blk->getSectorBlock();
++        // Update replacement data of accessed block, which is shared with
++        // the whole sector it belongs to
++        replacementPolicy->touch(sector_blk->replacementData, pkt);
++    }
++
++    //cause segmentation fault b/c blk is null ptr so that other blk came from this blk has no data.
++    // Miss
++    if (blk==nullptr) {
++        // find avoidable miss
++        if (searchCompressibleBlk(pkt->getAddr(), pkt->isSecure())){
++            // std::cout << "avoidable miss" << "\n";
++            gcp_factor += gcp_inc;
++            printf("[%s], Avoidable Miss, gcp_factor: %d, curTick: %lu \n", __func__, gcp_factor, curTick());
++        }
++    }
++    //printf("gcp_factor = %d\n", gcp_factor);
++    // The tag lookup latency is the same for a hit or a miss
++    lat = lookupLatency;
++
++    return blk;
++}
++
++
++int
++CompressedTags::getGcpFactor() const
++{   
++    //std::cout << "getgcp: " << gcp_factor << "\n";
++    return gcp_factor;
++}
++
++
++CacheBlk*
+ CompressedTags::findVictim(Addr addr, const bool is_secure,
+                            const std::size_t compressed_size,
+                            std::vector<CacheBlk*>& evict_blks)
+@@ -182,4 +268,42 @@ CompressedTags::anyBlk(std::function<bool(CacheBlk &)> visitor)
+     return false;
+ }
+ 
++bool
++CompressedTags::searchCompressibleBlk(Addr addr, bool is_secure) const
++{
++    // Extract block tag
++    Addr tag = extractTag(addr);
++    
++    // The address can only be mapped to a specific location of a sector
++    // due to sectors being composed of contiguous-address entries
++    const uint64_t offset = extractSectorOffset(addr);
++
++    // Find possible entries that may contain the given address
++    const std::vector<ReplaceableEntry*> entries =
++        indexingPolicy->getPossibleEntries(addr);
++
++    // Search for block
++    for (const auto& location : entries) {
++
++        SuperBlk* super_blk = static_cast<SuperBlk*>(location);
++        CompressionBlk* compressed_blk = static_cast<CompressionBlk*>(super_blk->blks[offset^1]);
++
++        if(super_blk->matchTag(tag, is_secure)){
++            if(compressed_blk->isValid()){
++                if(!super_blk->isCompressed()){
++                    if((super_blk->getNumValid())==1){
++                            if( compressed_blk->getSizeBits() <= super_blk->getBlkSize()*CHAR_BIT / 2){
++                                return true; 
++                            }
++                        }
++                    }
++                }
++            }
++        }
++        // Did not find block
++
++    return false;
++
++    }
++
+ } // namespace gem5
+diff --git a/src/mem/cache/tags/compressed_tags.hh b/src/mem/cache/tags/compressed_tags.hh
+index b54efb0..813cfbf 100644
+--- a/src/mem/cache/tags/compressed_tags.hh
++++ b/src/mem/cache/tags/compressed_tags.hh
+@@ -74,6 +74,10 @@ class CompressedTags : public SectorTags
+     std::vector<CompressionBlk> blks;
+     /** The cache superblocks. */
+     std::vector<SuperBlk> superBlks;
++    /*gcp factor*/
++    int gcp_factor;
++    int gcp_inc;
++    int gcp_dec;
+ 
+   public:
+     /** Convenience typedef. */
+@@ -95,6 +99,23 @@ class CompressedTags : public SectorTags
+     void tagsInit() override;
+ 
+     /**
++     * Access block and update replacement data. May not succeed, in which
++     * case nullptr is returned. This has all the implications of a cache
++     * access and should only be used as such. Returns the tag lookup latency
++     * as a side effect.
++     *
++     * @param pkt The packet holding the address to find.
++     * @param lat The latency of the tag lookup.
++     * @return Pointer to the cache block if found.
++     */
++    CacheBlk* accessBlock(const PacketPtr pkt, Cycles &lat) override;
++
++    /*
++    * @ return gcpfactor
++    */
++    int getGcpFactor() const;
++
++    /**
+      * Find replacement victim based on address. Checks if data can be co-
+      * allocated before choosing blocks to be evicted.
+      *
+@@ -128,8 +149,19 @@ class CompressedTags : public SectorTags
+      * @param visitor Visitor to call on each block.
+      */
+     bool anyBlk(std::function<bool(CacheBlk &)> visitor) override;
++
++    /**
++     * Finds the block in the cache without touching it.
++     *
++     * @param addr The address to look for.
++     * @param is_secure True if the target memory space is secure.
++     * @return bool to the cache block.
++     */
++    bool searchCompressibleBlk(Addr addr, bool is_secure) const;
++
+ };
+ 
++
+ } // namespace gem5
+ 
+ #endif //__MEM_CACHE_TAGS_COMPRESSED_TAGS_HH__
+diff --git a/src/mem/cache/tags/sector_tags.cc b/src/mem/cache/tags/sector_tags.cc
+index cb121eb..448f654 100644
+--- a/src/mem/cache/tags/sector_tags.cc
++++ b/src/mem/cache/tags/sector_tags.cc
+@@ -141,7 +141,7 @@ SectorTags::invalidate(CacheBlk *blk)
+ CacheBlk*
+ SectorTags::accessBlock(const PacketPtr pkt, Cycles &lat)
+ {
+-    CacheBlk *blk = findBlock(pkt->getAddr(), pkt->isSecure());
++    CacheBlk* blk = findBlock(pkt->getAddr(), pkt->isSecure());
+ 
+     // Access all tags in parallel, hence one in each way.  The data side
+     // either accesses all blocks in parallel, or one block sequentially on
+@@ -156,6 +156,7 @@ SectorTags::accessBlock(const PacketPtr pkt, Cycles &lat)
+     }
+ 
+     // If a cache hit
++    //여기서 cache hit을 나누면 될듯
+     if (blk != nullptr) {
+         // Update number of references to accessed block
+         blk->increaseRefCount();
+@@ -168,6 +169,7 @@ SectorTags::accessBlock(const PacketPtr pkt, Cycles &lat)
+         // the whole sector it belongs to
+         replacementPolicy->touch(sector_blk->replacementData, pkt);
+     }
++    //miss 나누기
+ 
+     // The tag lookup latency is the same for a hit or a miss
+     lat = lookupLatency;
+diff --git a/src/mem/cache/tags/super_blk.cc b/src/mem/cache/tags/super_blk.cc
+index 4ce3ef1..3a2bfa8 100644
+--- a/src/mem/cache/tags/super_blk.cc
++++ b/src/mem/cache/tags/super_blk.cc
+@@ -203,6 +203,12 @@ SuperBlk::canCoAllocate(const std::size_t compressed_size) const
+         (compressed_size <= (blkSize * CHAR_BIT) / getCompressionFactor());
+ }
+ 
++std::size_t
++SuperBlk::getBlkSize() const
++{
++    return blkSize;
++}
++
+ void
+ SuperBlk::setBlkSize(const std::size_t blk_size)
+ {
+diff --git a/src/mem/cache/tags/super_blk.hh b/src/mem/cache/tags/super_blk.hh
+index 9057c24..0883708 100644
+--- a/src/mem/cache/tags/super_blk.hh
++++ b/src/mem/cache/tags/super_blk.hh
+@@ -203,6 +203,13 @@ class SuperBlk : public SectorBlk
+      */
+     bool canCoAllocate(const std::size_t compressed_size) const;
+ 
++    /*
++     * Get size, in bits, of this super block's data.
++     *
++     * @return The superblock size.
++     */
++    std::size_t getBlkSize() const;
++
+     /**
+      * Set block size. Should be called only once, when initializing blocks.
+      *
