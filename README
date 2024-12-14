@@ -1,5 +1,7 @@
 This is the adaptive cache compression based on gem5 simulator.
 
+If you want to run my design, go to script/run.sh. I apply the compression policy only in L2 cache. 
+
 The main website can be found at http://www.gem5.org
 
 A good starting point is http://www.gem5.org/about, and for
